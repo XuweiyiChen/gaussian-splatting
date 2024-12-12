@@ -20,6 +20,7 @@ from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from scipy.spatial import cKDTree
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -123,6 +124,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             ssim_value = ssim(image, gt_image)
 
+        centers = gaussians._xyz.detach().cpu()
+        # Compute scene bounds and volume
+        scene_min = centers.min(dim=0).values.numpy()
+        scene_max = centers.max(dim=0).values.numpy()
+        scene_extent = scene_max - scene_min
+        volume = (scene_extent[0] * scene_extent[1] * scene_extent[2])
+        # Number of points and expected uniform spacing
+        N = centers.shape[0]
+        expected_spacing = (volume / N) ** (1.0 / 3.0)
+        # Build KD-tree and query nearest neighbors
+        centers_np = centers.numpy()
+        tree = cKDTree(centers_np)
+        k = 10
+        dists, _ = tree.query(centers_np, k=k+1)  # First neighbor is the point itself (dist=0)
+        neighbor_dists = dists[:, 1:]  # Remove self-distance
+        # Normalize distances by expected spacing
+        normalized_dists = torch.tensor(neighbor_dists, dtype=torch.float32, device='cuda') / expected_spacing
+        # Compute repulsion loss (small distances => large penalty)
+        repulsion_loss = (1.0 / (normalized_dists + 1e-8)).mean() / 1e6
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # Depth regularization
